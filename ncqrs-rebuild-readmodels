@@ -1,0 +1,265 @@
+using System;
+using System.Configuration;
+using System.Data;
+using System.Data.Entity;
+using System.Data.SqlClient;
+using System.Threading;
+using Educa.ReadModel;
+using Educa.ReadModel.Id.Denormalizers;
+using Educa.ReadModel.Schools.Denormalizers;
+using Ncqrs.EventBus;
+using Ncqrs.Eventing.ServiceModel.Bus;
+using Ncqrs.Eventing.Storage.SQL;
+
+namespace Educa.ReadModelBuilder
+{
+
+    /// <summary>
+    /// Tool to rebuild the read models in Educa project.
+    /// This tools make this operations:
+    /// 1. Prepare RebuildEventStore database.
+    /// 2. Prepare RebuildReadModel database.
+    /// 3. Copy EventStore database from production to RebuildEventStore.
+    /// 4. Rebuild the read models replaying events. This fills RebuildReadModel database.
+    /// 5. Copy RebuildReadModel to ReadModel in production. This is made inside a transaction deleting and (using BulkCopy) inserting records in target database. 
+    /// 
+    /// To use this tool you have to:
+    /// - Configure Production connection strings 
+    /// - Create databases for Rebuild: RebuildEventStore and RebuildReadModel
+    /// - Configure Rebuild connection strings
+    /// </summary>
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            var connectionStringRebuildEventStore = ConfigurationManager.ConnectionStrings["RebuildEventStore"].ConnectionString;
+            var connectionStringEventStore = ConfigurationManager.ConnectionStrings["EventStore"].ConnectionString;
+
+            var connectionStringRebuildReadModel = ConfigurationManager.ConnectionStrings["RebuildReadModel"].ConnectionString;
+            var connectionStringReadModel = ConfigurationManager.ConnectionStrings["ReadModel"].ConnectionString;
+
+            InitRebuildEventStoreDatabase(connectionStringRebuildEventStore);
+
+            InitRebuildReadModel(connectionStringReadModel, connectionStringRebuildReadModel);
+
+            CopyEventsToRebuildEventStore(connectionStringEventStore, connectionStringRebuildEventStore);
+
+            RebuildReadModels(connectionStringRebuildEventStore, connectionStringRebuildReadModel);
+
+            CopyRebuiltReadModels(connectionStringRebuildReadModel, connectionStringReadModel);
+
+            Console.Write("Press any key to end...");
+            Console.ReadLine();
+        }
+
+        private static void InitRebuildEventStoreDatabase(string connectionStringRebuildEventStore)
+        {
+            Console.WriteLine("Initializing event store for rebuilding...");
+
+            //INFO: this constructor will generate tables if necessary
+            var dsa = new MsSqlServerEventStore(connectionStringRebuildEventStore);
+
+            //now erase all tables if neccesary
+            using (var connection = new SqlConnection(connectionStringRebuildEventStore))
+            {
+                connection.Open();
+
+                using (var command = new SqlCommand(@"
+delete dbo.PipelineState
+delete dbo.Events
+delete dbo.Snapshots
+delete dbo.EventSources
+", connection))
+                {
+                    command.ExecuteNonQuery();
+                }
+            }
+        }
+
+        private static void CopyEventsToRebuildEventStore(string connectionStringEventStore, string connectionStringRebuildEventStore)
+        {
+            Console.WriteLine("Copying events to event store for rebuilding...");
+            CopyTable(connectionStringEventStore, connectionStringRebuildEventStore, "dbo.EventSources", false);
+            CopyTable(connectionStringEventStore, connectionStringRebuildEventStore, "dbo.Snapshots", false);
+            CopyTable(connectionStringEventStore, connectionStringRebuildEventStore, "dbo.Events", false);
+            
+            //INFO: PipelineState is ommited to allow the replay of events
+            //CopyTable(connectionStringEventStore, connectionStringRebuildEventStore, "dbo.PipelineState", false);
+        }
+
+        private static void CopyTable(string connectionStringSource, string connectionStringTarget, string tableName, bool deleteExistingRows)
+        {
+            Console.WriteLine("Starting to copy table {0}", tableName);
+            using (var connectionSource = new SqlConnection(connectionStringSource))
+            {
+                connectionSource.Open();
+
+                using (var command = new SqlCommand(@"SELECT * FROM " + tableName, connectionSource))
+                {
+                    using (var reader = command.ExecuteReader())
+                    {
+                        using (var connectionTarget = new SqlConnection(connectionStringTarget))
+                        {
+                            connectionTarget.Open();
+
+                            var transaction = connectionTarget.BeginTransaction("DeleteAndCopy");
+
+                            try
+                            {
+                                long countStart;
+                                using (var commandRowCount = new SqlCommand("SELECT COUNT(*) FROM " + tableName, connectionTarget, transaction))
+                                {
+                                    countStart = System.Convert.ToInt32(commandRowCount.ExecuteScalar());
+                                    Console.WriteLine("{0} rows exists initially in table {1}.", countStart, tableName);
+                                }
+
+                                if (deleteExistingRows)
+                                {
+                                    countStart = 0;
+                                    using (var commandDelete = new SqlCommand("DELETE FROM " + tableName, connectionTarget, transaction))
+                                    {
+                                        int deletedCount = commandDelete.ExecuteNonQuery();
+                                        Console.WriteLine("{0} rows were deleted in table {1}.", deletedCount, tableName);
+                                    }
+                                }
+
+                                using (SqlBulkCopy bulkCopy = new SqlBulkCopy(connectionTarget, SqlBulkCopyOptions.Default, transaction))
+                                {
+                                    bulkCopy.DestinationTableName = tableName;
+
+                                    try
+                                    {
+                                        // Write from the source to the destination.
+                                        bulkCopy.WriteToServer(reader);
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Console.WriteLine(ex.Message);
+                                        throw;
+                                    }
+                                }
+
+                                using (var commandRowCount = new SqlCommand("SELECT COUNT(*) FROM " + tableName, connectionTarget, transaction))
+                                {
+                                    long countEnd = System.Convert.ToInt32(commandRowCount.ExecuteScalar());
+                                    Console.WriteLine("{0} rows were added to table {1}.", countEnd - countStart, tableName);
+                                }
+
+                                transaction.Commit();
+                            }
+                            catch (Exception ex)
+                            {
+                                try
+                                {
+                                    transaction.Rollback();
+                                }
+                                catch (Exception ex2)
+                                {
+                                    // This catch block will handle any errors that may have occurred
+                                    // on the server that would cause the rollback to fail, such as
+                                    // a closed connection.
+                                    Console.WriteLine("Rollback Exception Type: {0}", ex2.GetType());
+                                    Console.WriteLine("  Message: {0}", ex2.Message);
+                                }
+
+                                throw;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        private static void InitRebuildReadModel(string connectionStringReadModel, string connectionStringRebuildReadModel)
+        {
+            Console.WriteLine("Initializing read model for rebuilding...");
+
+            //get tables definitions
+            using (var connectionTarget = new SqlConnection(connectionStringRebuildReadModel))
+            {
+                connectionTarget.Open();
+                var databasesTable = connectionTarget.GetSchema(SqlClientMetaDataCollectionNames.Tables);
+                foreach (DataRow item in databasesTable.Rows)
+                {
+                    string tableName = item["table_schema"] + "." + item["table_name"];
+                    using (var command = new SqlCommand("drop table " + tableName, connectionTarget))
+                    {
+                        command.ExecuteNonQuery();
+                        Console.WriteLine("Table {0} deleted from read model for rebuilding...", tableName);
+                    }
+                }
+            }
+
+            Console.WriteLine("Creating tables in read model for rebuilding...");
+
+            var dbInitializer = new MigrateDatabaseToLatestVersionFixed<EducaReadModelContainer, Educa.ReadModel.Migrations.Configuration>(connectionStringRebuildReadModel);
+            Database.SetInitializer(dbInitializer);
+            //force database schema update
+            EducaReadModelContainer.ConnectionStringName = "RebuildReadModel";
+            using (var context = new EducaReadModelContainer("RebuildReadModel"))
+            {
+                dbInitializer.InitializeDatabase(context);
+            }
+
+            using (var connectionTarget = new SqlConnection(connectionStringRebuildReadModel))
+            {
+                connectionTarget.Open();
+                var databasesTable = connectionTarget.GetSchema(SqlClientMetaDataCollectionNames.Tables);
+                foreach (DataRow item in databasesTable.Rows)
+                {
+                    string tableName = item["table_schema"] + "." + item["table_name"];
+                    Console.WriteLine("Table {0} created in read model for rebuilding...", tableName);
+                }
+            }
+        }
+
+        private static void RebuildReadModels(string connectionStringRebuildEventStore, string connectionStringRebuildReadModel)
+        {
+            Console.WriteLine("Rebuilding event models...");
+
+            var bus = new InProcessEventBus(true);
+            //denormalizers
+            bus.RegisterAllHandlersInAssembly(typeof(UserDenormalizer).Assembly);
+            bus.RegisterAllHandlersInAssembly(typeof(SuperadminDenormalizer).Assembly);
+
+            var browsableEventStore = new MsSqlServerEventStoreElementStore(connectionStringRebuildEventStore);
+            var buffer = new InMemoryBufferedBrowsableElementStore(browsableEventStore, 20 /*magic number found in ThresholedFetchPolicy*/);
+            var processor = new EventBusProcessor(bus);
+            var pipeline = Pipeline.CreateWithLazyElementMarking("Default", processor, buffer);
+
+            pipeline.Start();
+
+            //wait for a "big" elapsed time with no events
+            while (DateTime.Now.Subtract(processor.LastEventPublishedTime).TotalSeconds < 10)
+            {
+                Thread.Sleep(100);
+            }
+
+            pipeline.Stop();
+        }
+
+        private static void CopyRebuiltReadModels(string connectionStringRebuildReadModel, string connectionStringReadModel)
+        {
+            using (var connectionSource = new SqlConnection(connectionStringRebuildReadModel))
+            {
+                connectionSource.Open();
+                var databasesTable = connectionSource.GetSchema(SqlClientMetaDataCollectionNames.Tables);
+                foreach (DataRow item in databasesTable.Rows)
+                {
+                    string tableNameWithoutSchema = item["table_name"].ToString();
+                    //omit migration control table
+                    if (tableNameWithoutSchema.Equals("__MigrationHistory", StringComparison.InvariantCultureIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    string tableName = item["table_schema"] + "." + tableNameWithoutSchema;
+                    
+                    CopyTable(connectionStringRebuildReadModel, connectionStringReadModel, tableName, true);
+
+                    Console.WriteLine("Table {0} created in read model for rebuilding...", tableName);
+                }
+            }
+        }
+    }
+}
