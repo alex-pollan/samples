@@ -195,6 +195,8 @@ delete dbo.EventSources
             var dbInitializer = new MigrateDatabaseToLatestVersionFixed<EducaReadModelContainer, Educa.ReadModel.Migrations.Configuration>(connectionStringRebuildReadModel);
             Database.SetInitializer(dbInitializer);
             //force database schema update
+            
+            //HACK: hack to "inject" the connection string and avoid migrator limitation
             EducaReadModelContainer.ConnectionStringName = "RebuildReadModel";
             using (var context = new EducaReadModelContainer("RebuildReadModel"))
             {
@@ -218,6 +220,10 @@ delete dbo.EventSources
             Console.WriteLine("Rebuilding event models...");
 
             var bus = new InProcessEventBus(true);
+
+            //HACK: hack to "inject" the connection string. Don't do that at home! :-) 
+            EducaReadModelContainer.ConnectionStringName = "RebuildReadModel";
+
             //denormalizers
             bus.RegisterAllHandlersInAssembly(typeof(UserDenormalizer).Assembly);
             bus.RegisterAllHandlersInAssembly(typeof(SuperadminDenormalizer).Assembly);
